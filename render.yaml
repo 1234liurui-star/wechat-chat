@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: wechat-chat
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python chat_server.py
