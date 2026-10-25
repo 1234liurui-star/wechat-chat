@@ -1,6 +1,6 @@
 """
 多人实时聊天室（微信风格界面）—— 单文件版
-功能：文字 / 图片 / 视频消息，新消息提示音 + 系统通知（关掉页面也能收到），语音 / 视频通话
+功能：群聊 + 一对一私聊；文字 / 图片 / 视频消息；新消息提示音 + 系统通知（关掉页面也能收到）；语音 / 视频通话
 
 运行：
     pip install -r requirements.txt
@@ -49,14 +49,15 @@ except ImportError:            # 没装 pywebpush 也能跑，只是没有"关�
 
 app = FastAPI()
 
-HISTORY_SIZE = 100         # 新加入的人能看到的最近消息条数
+HISTORY_SIZE = 150         # 群聊保留的最近消息条数
+DM_HISTORY_SIZE = 150      # 每个私聊保留的最近消息条数
 MAX_MSG_LEN = 1000         # 单条消息最大长度
 MAX_NAME_LEN = 20          # 昵称最大长度
 MAX_AVATAR_LEN = 200_000   # 头像（压缩后的图片）最大长度
 MAX_IMAGE_MB = 15          # 单张图片上限
 MAX_VIDEO_MB = 100         # 单个视频上限
 MEDIA_CAP_MB = 800         # 服务器上最多保留多少图片/视频，超出后最早的会过期
-MAX_CALL = 6               # 一次通话最多几个人
+MAX_CALL = 6               # 一次群通话最多几个人
 MEDIA_DIR = Path(os.environ.get("MEDIA_DIR", "/tmp/chat_media"))
 
 IMAGE_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}
@@ -81,8 +82,17 @@ def new_id():
     return uuid.uuid4().hex[:12]
 
 
-def sysmsg(text):
-    return {"type": "system", "text": text, "time": now(), "ts": ms(), "id": new_id()}
+def sysmsg(text, name=None, to=None, quiet=False):
+    m = {"type": "system", "text": text, "time": now(), "ts": ms(), "id": new_id()}
+    if name and to:                       # 私聊里的系统消息（比如通话记录）
+        m["name"], m["to"] = name, to
+    if quiet:                             # 进出群提示，不显示在聊天列表的预览里
+        m["quiet"] = True
+    return m
+
+
+def dm_key(a, b):
+    return tuple(sorted((a, b)))
 
 
 # ---------------- 推送密钥 ----------------
@@ -129,25 +139,59 @@ def send_push(endpoint, entry, payload, ttl):
 
 class ChatRoom:
     def __init__(self):
-        self.clients: dict[WebSocket, str] = {}   # 连接 -> 昵称
-        self.history: deque = deque(maxlen=HISTORY_SIZE)
+        self.clients: dict[WebSocket, str] = {}   # 连接 -> 昵称（同一个人可以多台设备同时在线）
+        self.group: deque = deque(maxlen=HISTORY_SIZE)
+        self.dms: dict[tuple, deque] = {}         # (甲, 乙) -> 两人的私聊记录
         self.avatars: dict[str, str] = {}         # 昵称 -> 头像图片(data URL)
+        self.owner: dict[str, str] = {}           # 昵称 -> 设备身份码（防止别人冒用昵称看私聊）
+        self.seen: dict[str, int] = {}            # 来过的所有成员 -> 最后在线时间
         self.tokens: dict[str, str] = {}          # 上传凭证 -> 昵称
         self.subs: dict[str, dict] = {}           # 推送地址 -> {sub, name, host}
         self.ws_endpoint: dict[WebSocket, str] = {}
         self.visible: dict[WebSocket, bool] = {}  # 这个人现在是不是正看着聊天页面
-        self.call = None                          # 正在进行的通话
+        self.calls: dict[str, dict] = {}          # 通话 key -> 正在进行的通话
 
-    def names(self):
-        return sorted(self.clients.values())
+    def online(self):
+        return sorted(set(self.clients.values()))
+
+    def is_online(self, name):
+        return name in self.clients.values()
+
+    def claim_name(self, raw, uid):
+        """昵称属于第一个用它的设备；别的设备用同样的昵称会自动加编号"""
+        name, i = raw, 2
+        while self.owner.get(name) not in (None, uid):
+            name = f"{raw}({i})"
+            i += 1
+        self.owner[name] = uid
+        return name
 
     # ---------- 消息 ----------
+    def box(self, m):
+        if m.get("to"):
+            return self.dms.setdefault(dm_key(m["name"], m["to"]), deque(maxlen=DM_HISTORY_SIZE))
+        return self.group
+
+    def all_msgs(self):
+        yield from self.group
+        for d in self.dms.values():
+            yield from d
+
+    def history_for(self, name):
+        msgs = list(self.group)
+        for k, d in self.dms.items():
+            if name in k:
+                msgs.extend(d)
+        return sorted(msgs, key=lambda m: m["ts"])
+
     def remember(self, payload):
-        if len(self.history) == self.history.maxlen:
-            drop_media(self.history[0])
-        self.history.append(payload)
+        box = self.box(payload)
+        if len(box) == box.maxlen:
+            drop_media(box[0])
+        box.append(payload)
         if payload.get("url"):
-            items = [m for m in self.history if m.get("url") and not m.get("expired")]
+            items = sorted((m for m in self.all_msgs() if m.get("url") and not m.get("expired")),
+                           key=lambda m: m["ts"])
             total = sum(m.get("size", 0) for m in items)
             for m in items:
                 if total <= MEDIA_CAP_MB * 1024 * 1024:
@@ -155,10 +199,7 @@ class ChatRoom:
                 total -= m.get("size", 0)
                 drop_media(m)
 
-    async def broadcast(self, payload: dict, save=True):
-        if save:
-            self.remember(payload)
-        text = json.dumps(payload, ensure_ascii=False)
+    async def broadcast_text(self, text):
         dead = []
         for ws in list(self.clients):
             try:
@@ -167,6 +208,11 @@ class ChatRoom:
                 dead.append(ws)
         for ws in dead:
             self.clients.pop(ws, None)
+
+    async def broadcast(self, payload: dict, save=True):
+        if save:
+            self.remember(payload)
+        await self.broadcast_text(json.dumps(payload, ensure_ascii=False))
 
     async def send_to(self, name, payload):
         text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
@@ -177,21 +223,22 @@ class ChatRoom:
                 except Exception:
                     pass
 
+    async def deliver(self, payload):
+        """保存消息，并只发给该看到的人：群消息发给所有人，私聊只发给两个人"""
+        if not payload.get("to"):
+            await self.broadcast(payload)
+            return
+        self.remember(payload)
+        text = json.dumps(payload, ensure_ascii=False)
+        await self.send_to(payload["name"], text)
+        if payload["to"] != payload["name"]:
+            await self.send_to(payload["to"], text)
+
     async def send_users(self):
-        await self.broadcast({"type": "users", "users": self.names()}, save=False)
+        await self.broadcast({"type": "users", "users": self.online(), "members": sorted(self.seen)}, save=False)
 
     async def send_avatars(self):
         await self.broadcast({"type": "avatars", "avatars": self.avatars}, save=False)
-
-    def unique_name(self, name: str) -> str:
-        """昵称重复时自动加编号"""
-        taken = set(self.clients.values())
-        if name not in taken:
-            return name
-        i = 2
-        while f"{name}({i})" in taken:
-            i += 1
-        return f"{name}({i})"
 
     # ---------- 推送 ----------
     def add_sub(self, ws, name, sub, host):
@@ -209,37 +256,76 @@ class ChatRoom:
                          "name": name, "host": host or "localhost"}
         self.ws_endpoint[ws] = ep
 
-    def push(self, payload, exclude, ttl=86400):
-        """给不在看聊天页面的人发系统通知（锁屏、后台都能收到）"""
+    def push(self, payload, exclude=None, only=None, ttl=86400):
+        """给不在看聊天页面的人发系统通知（锁屏、后台都能收到）。only=只发给这个人"""
         if not PUSH_OK or not self.subs:
             return
         watching = {self.ws_endpoint.get(w) for w, v in self.visible.items() if v and w in self.clients}
         for ep, entry in list(self.subs.items()):
             if entry["name"] == exclude or ep in watching:
                 continue
+            if only is not None and entry["name"] != only:
+                continue
             asyncio.get_running_loop().run_in_executor(None, send_push, ep, entry, payload, ttl)
 
-    # ---------- 通话 ----------
-    def call_public(self):
-        c = self.call
-        return c and {"media": c["media"], "members": c["members"], "by": c["by"], "start": c["start"]}
+    def push_msg(self, msg):
+        body = preview(msg)
+        if msg.get("to"):
+            self.push({"title": msg["name"], "body": body, "tag": "m-" + msg["id"], "kind": "msg",
+                       "conv": "dm:" + msg["name"]}, only=msg["to"])
+        else:
+            self.push({"title": "群聊", "body": f"{msg['name']}: {body}", "tag": "m-" + msg["id"], "kind": "msg",
+                       "conv": "group"}, exclude=msg["name"])
 
-    async def send_call(self):
-        await self.broadcast({"type": "call_state", "call": self.call_public()}, save=False)
+    # ---------- 通话 ----------
+    @staticmethod
+    def call_key(name, to):
+        return "dm:" + "\n".join(dm_key(name, to)) if to else "group"
+
+    def call_of(self, name):
+        for c in self.calls.values():
+            if name in c["members"]:
+                return c
+        return None
+
+    @staticmethod
+    def call_public(c, ended=False):
+        return {"media": c["media"], "members": c["members"], "by": c["by"], "start": c["start"],
+                "invite": c["invite"], "ended": ended}
+
+    def calls_for(self, name):
+        return [self.call_public(c) for c in self.calls.values() if not c["invite"] or name in c["invite"]]
+
+    async def send_call(self, c, ended=False):
+        text = json.dumps({"type": "call_state", "call": self.call_public(c, ended)}, ensure_ascii=False)
+        if c["invite"]:
+            for n in c["invite"]:
+                await self.send_to(n, text)
+        else:
+            await self.broadcast_text(text)
+
+    async def call_note(self, c, text):
+        if c["invite"]:
+            other = next((n for n in c["invite"] if n != c["by"]), c["by"])
+            await self.deliver(sysmsg(text, name=c["by"], to=other))
+        else:
+            await self.deliver(sysmsg(text))
 
     async def leave_call(self, name):
-        c = self.call
-        if not c or name not in c["members"]:
+        c = self.call_of(name)
+        if not c:
             return
         c["members"].remove(name)
         if not c["members"]:
-            self.call = None
+            self.calls.pop(c["key"], None)
             if c.get("talk_at"):
                 secs = int(time.time() - c["talk_at"])
-                await self.broadcast(sysmsg(f"通话结束，时长 {secs // 60:02d}:{secs % 60:02d}"))
+                await self.call_note(c, f"通话结束，时长 {secs // 60:02d}:{secs % 60:02d}")
             else:
-                await self.broadcast(sysmsg("通话已取消"))
-        await self.send_call()
+                await self.call_note(c, "通话已取消")
+            await self.send_call(c, ended=True)
+        else:
+            await self.send_call(c)
 
 
 room = ChatRoom()
@@ -264,36 +350,64 @@ def preview(m):
     return {"image": "[图片]", "video": "[视频]"}.get(m["type"]) or m.get("text", "")[:120]
 
 
+def valid_to(name, to):
+    """私聊对象必须是来过群里的其他成员"""
+    return isinstance(to, str) and to != name and to in room.seen
+
+
+async def toast(ws, text):
+    await ws.send_text(json.dumps({"type": "toast", "text": text}, ensure_ascii=False))
+
+
 async def handle_call(ws, name, kind, data):
-    c = room.call
-    if kind == "call_start" and not c:
+    to = data.get("to") or None
+    if to is not None and not valid_to(name, to):
+        return
+    key = room.call_key(name, to)
+    c = room.calls.get(key)
+    if kind == "call_decline":
+        if c:
+            for m in list(c["members"]):
+                await room.send_to(m, {"type": "call_declined", "name": name})
+        return
+    if kind == "call_leave":
+        await room.leave_call(name)
+        return
+    # call_start / call_join
+    mine = room.call_of(name)
+    if mine and mine is not c:
+        await toast(ws, "你已经在另一个通话里了")
+        return
+    if not c:
+        if kind != "call_start":
+            await ws.send_text(json.dumps({"type": "call_state", "call": {
+                "media": "video", "members": [], "by": "", "start": 0,
+                "invite": sorted((name, to)) if to else None, "ended": True}}))
+            return
         media = "audio" if data.get("media") == "audio" else "video"
         label = "视频" if media == "video" else "语音"
-        c = room.call = {"media": media, "members": [], "by": name, "start": ms(), "talk_at": None}
-        await room.broadcast(sysmsg(f"{name} 发起了{label}通话"))
-        room.push({"title": name, "body": f"邀请你{label}通话", "tag": f"call-{c['start']}", "kind": "call"},
-                  exclude=name, ttl=60)
-        kind = "call_join"
-    if kind in ("call_start", "call_join"):
-        if not c:
-            await ws.send_text(json.dumps({"type": "call_state", "call": None}))
-            return
-        if name in c["members"]:
-            return
-        if len(c["members"]) >= MAX_CALL:
-            await ws.send_text(json.dumps({"type": "toast", "text": "通话人数已满"}, ensure_ascii=False))
-            return
-        peers = list(c["members"])
-        c["members"].append(name)
-        if len(c["members"]) >= 2 and not c["talk_at"]:
-            c["talk_at"] = time.time()
-        await ws.send_text(json.dumps({"type": "call_joined", "peers": peers, "media": c["media"]}))
-        await room.send_call()
-    elif kind == "call_leave":
-        await room.leave_call(name)
-    elif kind == "call_decline" and c:
-        for m in list(c["members"]):
-            await room.send_to(m, {"type": "call_declined", "name": name})
+        c = room.calls[key] = {"key": key, "media": media, "members": [], "by": name, "start": ms(),
+                               "talk_at": None, "invite": list(dm_key(name, to)) if to else None}
+        if to:
+            await room.call_note(c, f"{name} 发起了{label}通话")
+            room.push({"title": name, "body": f"邀请你{label}通话", "tag": f"call-{c['start']}", "kind": "call",
+                       "conv": "dm:" + name}, only=to, ttl=60)
+        else:
+            await room.call_note(c, f"{name} 发起了群{label}通话")
+            room.push({"title": name, "body": f"邀请你加入群{label}通话", "tag": f"call-{c['start']}",
+                       "kind": "call", "conv": "group"}, exclude=name, ttl=60)
+    if name in c["members"]:
+        return
+    limit = 2 if c["invite"] else MAX_CALL
+    if len(c["members"]) >= limit:
+        await toast(ws, "通话人数已满")
+        return
+    peers = list(c["members"])
+    c["members"].append(name)
+    if len(c["members"]) >= 2 and not c["talk_at"]:
+        c["talk_at"] = time.time()
+    await ws.send_text(json.dumps({"type": "call_joined", "peers": peers, "media": c["media"]}))
+    await room.send_call(c)
 
 
 @app.websocket("/ws")
@@ -302,25 +416,29 @@ async def websocket_endpoint(ws: WebSocket):
     name = None
     host = ws.headers.get("host", "")
     try:
-        # 第一条消息必须是 {"type": "join", "name": "..."}
+        # 第一条消息必须是 {"type": "join", "name": "...", "uid": "..."}
         first = json.loads(await ws.receive_text())
-        raw = str(first.get("name", "")).strip()[:MAX_NAME_LEN] or "匿名"
-        name = room.unique_name(raw)
+        raw = re.sub(r"[\x00-\x1f\x7f]", "", str(first.get("name", ""))).strip()[:MAX_NAME_LEN] or "匿名"
+        uid = str(first.get("uid") or "")[:64] or secrets.token_hex(12)
+        name = room.claim_name(raw, uid)
         if valid_avatar(first.get("avatar")):
             room.avatars[name] = first["avatar"]
         token = secrets.token_urlsafe(18)
         room.tokens[token] = name
+        first_device = not room.is_online(name)
+        room.seen[name] = ms()
 
-        # 先把历史记录和最终昵称发给新用户
+        # 先把历史记录（群聊 + 自己的私聊）和最终昵称发给新用户
         await ws.send_text(json.dumps({
-            "type": "welcome", "name": name, "history": list(room.history), "avatars": room.avatars,
-            "token": token, "vapid": VAPID_PUBLIC, "ice": ice_servers(), "call": room.call_public(),
+            "type": "welcome", "name": name, "history": room.history_for(name), "avatars": room.avatars,
+            "token": token, "vapid": VAPID_PUBLIC, "ice": ice_servers(), "calls": room.calls_for(name),
             "limits": {"image_mb": MAX_IMAGE_MB, "video_mb": MAX_VIDEO_MB},
         }, ensure_ascii=False))
 
         room.clients[ws] = name
         room.visible[ws] = bool(first.get("visible", True))
-        await room.broadcast(sysmsg(f"{name} 加入了聊天室"))
+        if first_device:
+            await room.broadcast(sysmsg(f"{name} 加入了聊天室", quiet=True))
         await room.send_users()
         await room.send_avatars()
 
@@ -343,17 +461,22 @@ async def websocket_endpoint(ws: WebSocket):
                 await handle_call(ws, name, kind, data)
             elif kind == "signal":           # 通话建立连接用的数据，原样转给对方
                 to, payload = data.get("to"), data.get("data")
-                if room.call and name in room.call["members"] and isinstance(to, str) and isinstance(payload, dict):
+                c = room.call_of(name)
+                if c and isinstance(to, str) and to in c["members"] and isinstance(payload, dict):
                     text = json.dumps({"type": "signal", "from": name, "data": payload}, ensure_ascii=False)
                     if len(text) < 100_000:
                         await room.send_to(to, text)
             else:
                 text = str(data.get("text", "")).strip()[:MAX_MSG_LEN]
+                to = data.get("to") or None
+                if to is not None and not valid_to(name, to):
+                    continue
                 if text:
                     msg = {"type": "chat", "name": name, "text": text, "time": now(), "ts": ms(), "id": new_id()}
-                    await room.broadcast(msg)
-                    room.push({"title": name, "body": preview(msg), "tag": "m-" + msg["id"], "kind": "msg"},
-                              exclude=name)
+                    if to:
+                        msg["to"] = to
+                    await room.deliver(msg)
+                    room.push_msg(msg)
 
     except (WebSocketDisconnect, json.JSONDecodeError):
         pass
@@ -362,18 +485,21 @@ async def websocket_endpoint(ws: WebSocket):
         room.ws_endpoint.pop(ws, None)
         if ws in room.clients:
             room.clients.pop(ws)
-            if name not in room.clients.values():
+            if not room.is_online(name):
+                room.seen[name] = ms()
                 await room.leave_call(name)
-            await room.broadcast(sysmsg(f"{name} 离开了聊天室"))
+                await room.broadcast(sysmsg(f"{name} 离开了聊天室", quiet=True))
             await room.send_users()
 
 
 @app.post("/upload")
-async def upload(request: Request, token: str = "", kind: str = "", cid: str = "",
+async def upload(request: Request, token: str = "", kind: str = "", cid: str = "", to: str = "",
                  w: int = 0, h: int = 0, dur: int = 0):
     name = room.tokens.get(token)
     if not name:
         return JSONResponse({"error": "请刷新页面后重试"}, status_code=403)
+    if to and not valid_to(name, to):
+        return JSONResponse({"error": "找不到这个人"}, status_code=400)
     types = IMAGE_TYPES if kind == "image" else VIDEO_TYPES if kind == "video" else None
     ctype = request.headers.get("content-type", "").split(";")[0].strip().lower()
     if not types or ctype not in types:
@@ -405,12 +531,14 @@ async def upload(request: Request, token: str = "", kind: str = "", cid: str = "
     clamp = lambda v: max(0, min(int(v), 20000))
     msg = {"type": kind, "name": name, "url": f"/media/{fname}", "w": clamp(w), "h": clamp(h),
            "size": size, "time": now(), "ts": ms(), "id": new_id()}
+    if to:
+        msg["to"] = to
     if dur:
         msg["dur"] = clamp(dur)
     if cid:
         msg["cid"] = cid[:40]
-    await room.broadcast(msg)
-    room.push({"title": name, "body": preview(msg), "tag": "m-" + msg["id"], "kind": "msg"}, exclude=name)
+    await room.deliver(msg)
+    room.push_msg(msg)
     return {"ok": True}
 
 
@@ -422,7 +550,7 @@ async def media(fname: str):
     if not path.is_file():
         return Response("这个文件已过期", status_code=404)
     return FileResponse(path, media_type=EXT_TYPES.get(path.suffix, "application/octet-stream"),
-                        headers={"Cache-Control": "public, max-age=31536000, immutable"})
+                        headers={"Cache-Control": "private, max-age=31536000, immutable"})
 
 
 @app.get("/")
@@ -488,15 +616,18 @@ self.addEventListener("push", e => {
   e.waitUntil(self.registration.showNotification(d.title || "群聊", {
     body: d.body || "有新消息", tag: d.tag || "chat", renotify: true,
     icon: "/icon-192.png", badge: "/icon-192.png", requireInteraction: call,
-    vibrate: call ? [500, 250, 500, 250, 500] : [200, 100, 200], data: { url: "/" }
+    vibrate: call ? [500, 250, 500, 250, 500] : [200, 100, 200], data: { conv: d.conv || "" }
   }));
 });
 self.addEventListener("notificationclick", e => {
   e.notification.close();
+  const conv = (e.notification.data && e.notification.data.conv) || "";
   e.waitUntil((async () => {
     const list = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    for (const c of list) { if ("focus" in c) return c.focus(); }
-    return self.clients.openWindow("/");
+    for (const c of list) {
+      if ("focus" in c) { await c.focus(); if (conv) c.postMessage({ open: conv }); return; }
+    }
+    return self.clients.openWindow("/" + (conv ? "#c=" + encodeURIComponent(conv) : ""));
   })());
 });
 """
@@ -519,27 +650,30 @@ PAGE = r"""<!doctype html>
 <style>
   :root { --bg:#ededed; --bar:#ededed; --input-bar:#f7f7f7; --field:#fff; --fg:#191919; --muted:#8a8a8a; --line:#d9d9d9;
           --other:#fff; --me:#95ec69; --me-fg:#191919; --green:#07c160; --green-press:#06ad56; --red:#fa5151;
-          --tip:#fdf6e3; --tip-fg:#8a6d1f; --callbar:#e7f7ee; --callbar-fg:#06964b; }
+          --tip:#fdf6e3; --tip-fg:#8a6d1f; --callbar:#e7f7ee; --callbar-fg:#06964b; --row-press:#ececec; }
   @media (prefers-color-scheme: dark) {
     :root { --bg:#111; --bar:#191919; --input-bar:#1e1e1e; --field:#2c2c2c; --fg:#e5e5e5; --muted:#7d7d7d; --line:#2a2a2a;
             --other:#2c2c2c; --me:#3eb575; --me-fg:#0d0d0d; --tip:#2b2614; --tip-fg:#d9bf72; --callbar:#13281d; --callbar-fg:#4cd38b;
-            color-scheme:dark; }
+            --row-press:#262626; color-scheme:dark; }
   }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html, body { height:100%; margin:0; }
   body { background:var(--bg); color:var(--fg); font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif; font-size:16px; }
   button { font:inherit; }
   svg.i { width:24px; height:24px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
-  .app { height:100%; display:flex; flex-direction:column; max-width:760px; margin:0 auto; }
+  .app { height:100%; max-width:760px; margin:0 auto; }
+  .view { height:100%; display:flex; flex-direction:column; }
   header { flex:none; height:48px; display:flex; align-items:center; justify-content:center; position:relative;
            background:var(--bar); border-bottom:.5px solid var(--line); padding-top:env(safe-area-inset-top,0px); box-sizing:content-box; }
-  header h1 { margin:0; font-size:17px; font-weight:600; }
-  header h1 span { font-weight:400; }
-  #status { font-size:12px; color:var(--muted); font-weight:400; margin-left:6px; }
-  .hbtn { position:absolute; bottom:6px; background:none; border:none; color:var(--fg); font-size:14px; padding:6px 8px; border-radius:6px; cursor:pointer; display:flex; align-items:center; }
+  header h1 { margin:0; font-size:17px; font-weight:600; max-width:60%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  header h1 .cnt { font-weight:400; }
+  .status { font-size:12px; color:var(--muted); font-weight:400; margin-left:6px; }
+  .hbtn { position:absolute; bottom:6px; background:none; border:none; color:var(--fg); font-size:14px; padding:6px 8px; border-radius:6px; cursor:pointer; display:flex; align-items:center; gap:2px; }
   .hbtn:hover { background:var(--line); }
-  #soundBtn { left:6px; }  #profileBtn { right:8px; }
+  .hbtn.left { left:6px; }  .hbtn.right { right:8px; }
   #soundBtn svg.i { width:22px; height:22px; }
+  #back svg.i { width:22px; height:22px; stroke-width:2; }
+  #back .ub { font-size:13px; color:var(--muted); }
   .strip { flex:none; display:flex; align-items:center; gap:10px; padding:8px 12px; font-size:13px; line-height:1.4; }
   #alertBar { background:var(--tip); color:var(--tip-fg); }
   #alertBar .t { flex:1; }
@@ -547,6 +681,27 @@ PAGE = r"""<!doctype html>
   #alertOn { background:var(--green); color:#fff; padding:5px 12px; font-size:13px; }
   #alertX { background:none; color:inherit; font-size:18px; padding:0 4px; line-height:1; }
   #callBar { background:var(--callbar); color:var(--callbar-fg); cursor:pointer; justify-content:center; font-weight:500; }
+
+  /* ---------- 聊天列表 ---------- */
+  #convList { flex:1; overflow-y:auto; background:var(--field); }
+  .conv { display:flex; align-items:center; gap:12px; padding:12px 16px; cursor:pointer; position:relative; }
+  .conv:active { background:var(--row-press); }
+  .conv + .conv::before { content:""; position:absolute; top:0; left:72px; right:0; border-top:.5px solid var(--line); }
+  .conv .av { position:relative; flex:none; }
+  .conv .avatar { width:44px; height:44px; font-size:18px; }
+  .badge { position:absolute; top:-6px; right:-7px; min-width:18px; height:18px; padding:0 5px; border-radius:9px; background:var(--red); color:#fff;
+           font-size:11px; line-height:18px; text-align:center; font-weight:500; font-variant-numeric:tabular-nums; }
+  .dot { position:absolute; right:-2px; bottom:-2px; width:12px; height:12px; border-radius:50%; background:var(--green); border:2px solid var(--field); }
+  .cmain { flex:1; min-width:0; display:flex; flex-direction:column; gap:3px; }
+  .ctop { display:flex; align-items:baseline; gap:8px; }
+  .ctitle { flex:1; min-width:0; font-size:16px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .ctime { flex:none; font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .cprev { font-size:13px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .cprev .live { color:var(--green); }
+  .gav { background:var(--green); }
+  .gav svg.i { width:26px; height:26px; stroke:#fff; stroke-width:1.8; }
+
+  /* ---------- 聊天窗口 ---------- */
   #list { flex:1; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:16px; }
   .time { align-self:center; font-size:12px; color:var(--muted); }
   .sys { align-self:center; font-size:12px; color:var(--muted); background:rgba(0,0,0,.06); padding:3px 8px; border-radius:4px; text-align:center; }
@@ -557,7 +712,8 @@ PAGE = r"""<!doctype html>
   .body { display:flex; flex-direction:column; min-width:0; max-width:calc(100% - 110px); }
   .msg.me .body { align-items:flex-end; }
   .name { font-size:12px; color:var(--muted); margin:0 0 4px 2px; }
-  .msg.me .name { display:none; }
+  .msg.me .name, #list.dm .name { display:none; }
+  .msg .avatar { cursor:pointer; }
   .bubble { position:relative; background:var(--other); padding:9px 12px; border-radius:5px; line-height:1.45;
             white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere; }
   .bubble::before { content:""; position:absolute; top:13px; left:-5px; width:10px; height:10px; background:inherit; transform:rotate(45deg); }
@@ -567,7 +723,7 @@ PAGE = r"""<!doctype html>
   .media { position:relative; border-radius:6px; overflow:hidden; background:var(--line); max-width:100%; }
   .media img { display:block; width:100%; height:100%; object-fit:cover; cursor:zoom-in; }
   .media video { display:block; width:100%; height:100%; object-fit:contain; background:#000; }
-  .media .up { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,.45); color:#fff; font-size:14px; }
+  .media .up { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,.45); color:#fff; font-size:14px; text-align:center; padding:6px; }
   .media .up.err { background:rgba(0,0,0,.6); color:#ff8d8d; cursor:pointer; }
   footer { flex:none; display:flex; gap:8px; align-items:flex-end; background:var(--input-bar); border-top:.5px solid var(--line);
            padding:8px 12px calc(8px + env(safe-area-inset-bottom,0px)); }
@@ -584,17 +740,19 @@ PAGE = r"""<!doctype html>
   #more button { background:none; border:none; color:var(--muted); font-size:12px; cursor:pointer; display:flex; flex-direction:column; align-items:center; gap:7px; }
   #more .ic { width:58px; height:58px; border-radius:14px; background:var(--field); color:var(--fg); display:flex; align-items:center; justify-content:center; }
   #more .ic svg.i { width:28px; height:28px; }
+
+  /* ---------- 资料弹窗 ---------- */
   .sheet-wrap { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex; align-items:center; justify-content:center; padding:16px; z-index:20; }
   .sheet { background:var(--bar); border-radius:12px; width:min(100%,320px); padding:20px; display:flex; flex-direction:column; gap:14px; }
   .sheet h2 { margin:0; font-size:17px; text-align:center; }
   #nick { border:none; outline:none; border-radius:6px; background:var(--field); color:var(--fg); font:inherit; padding:10px 12px; }
   #join { height:40px; border:none; border-radius:6px; background:var(--green); color:#fff; cursor:pointer; }
   img.avatar { object-fit:cover; background:var(--line); }
-  .msg.me .avatar { cursor:pointer; }
   .pick { display:flex; flex-direction:column; align-items:center; gap:8px; }
   #preview { width:72px; height:72px; border-radius:8px; font-size:28px; }
   .links { display:flex; gap:16px; }
-  .links button { background:none; border:none; color:var(--green); font-size:14px; cursor:pointer; padding:4px; }
+  .links button, #loginLink { background:none; border:none; color:var(--green); font-size:14px; cursor:pointer; padding:4px; }
+  #loginLink { font-size:13px; align-self:center; }
   .row2 { display:flex; gap:10px; }
   .row2 button { flex:1; }
   #cancel { height:40px; border:none; border-radius:6px; background:var(--field); color:var(--fg); cursor:pointer; }
@@ -607,7 +765,7 @@ PAGE = r"""<!doctype html>
   .overlay { position:fixed; inset:0; z-index:40; background:#141414; color:#fff; }
   #ring { display:flex; flex-direction:column; align-items:center; justify-content:space-between;
           padding:calc(70px + env(safe-area-inset-top,0px)) 24px calc(60px + env(safe-area-inset-bottom,0px)); }
-  .ring-who { display:flex; flex-direction:column; align-items:center; gap:14px; }
+  .ring-who { display:flex; flex-direction:column; align-items:center; gap:14px; text-align:center; }
   .avatar.big { width:96px; height:96px; border-radius:12px; font-size:40px; }
   #ringName { font-size:24px; font-weight:600; }
   #ringText { font-size:15px; color:#bbb; }
@@ -646,6 +804,8 @@ PAGE = r"""<!doctype html>
 <svg width="0" height="0" style="position:absolute">
   <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 16v-5a6 6 0 0112 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 004 0"/></symbol>
   <symbol id="i-bell-off" viewBox="0 0 24 24"><path d="M6 16v-5a6 6 0 0112 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 004 0"/><path d="M4 4l16 16"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 4.5L7.5 12l7.5 7.5"/></symbol>
+  <symbol id="i-group" viewBox="0 0 24 24"><circle cx="9" cy="8.5" r="3.2"/><path d="M3 19.5c.6-3.4 3-5.3 6-5.3s5.4 1.9 6 5.3"/><path d="M15.5 5.6a3 3 0 010 5.8M17.6 14.6c1.8.7 3 2.4 3.4 4.9"/></symbol>
   <symbol id="i-plus" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M12 7.5v9M7.5 12h9"/></symbol>
   <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M4 17l5-5 4 4 3-3 4 4"/></symbol>
   <symbol id="i-camera" viewBox="0 0 24 24"><path d="M4 8h3l2-2.5h6L17 8h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></symbol>
@@ -659,26 +819,36 @@ PAGE = r"""<!doctype html>
 </svg>
 
 <div class="app">
-  <header>
-    <button id="soundBtn" class="hbtn" hidden aria-label="提示音"><svg class="i"><use href="#i-bell"/></svg></button>
-    <h1>群聊<span id="count"></span><span id="status"></span></h1>
-    <button id="profileBtn" class="hbtn" hidden>资料</button>
-  </header>
-  <div id="alertBar" class="strip" hidden><span class="t"></span><button id="alertOn" hidden>开启</button><button id="alertX" aria-label="关闭">×</button></div>
-  <div id="callBar" class="strip" hidden></div>
-  <main id="list"></main>
-  <footer id="foot">
-    <textarea id="text" rows="1" placeholder="发消息" maxlength="1000"></textarea>
-    <button id="plus" aria-label="更多"><svg class="i"><use href="#i-plus"/></svg></button>
-    <button id="send" hidden>发送</button>
-  </footer>
-  <div id="more" hidden>
-    <button data-act="album"><span class="ic"><svg class="i"><use href="#i-image"/></svg></span>照片/视频</button>
-    <button data-act="photo"><span class="ic"><svg class="i"><use href="#i-camera"/></svg></span>拍照</button>
-    <button data-act="record"><span class="ic"><svg class="i"><use href="#i-record"/></svg></span>录像</button>
-    <button data-act="vcall"><span class="ic"><svg class="i"><use href="#i-video"/></svg></span>视频通话</button>
-    <button data-act="acall"><span class="ic"><svg class="i"><use href="#i-phone"/></svg></span>语音通话</button>
-  </div>
+  <section id="home" class="view">
+    <header>
+      <button id="soundBtn" class="hbtn left" hidden aria-label="提示音"><svg class="i"><use href="#i-bell"/></svg></button>
+      <h1>消息<span class="status"></span></h1>
+      <button id="profileBtn" class="hbtn right" hidden>资料</button>
+    </header>
+    <div id="alertBar" class="strip" hidden><span class="t"></span><button id="alertOn" hidden>开启</button><button id="alertX" aria-label="关闭">×</button></div>
+    <div id="convList"></div>
+  </section>
+
+  <section id="chat" class="view" hidden>
+    <header>
+      <button id="back" class="hbtn left" aria-label="返回"><svg class="i"><use href="#i-back"/></svg><span class="ub"></span></button>
+      <h1><span id="chatTitle"></span><span class="cnt" id="chatCount"></span><span class="status"></span></h1>
+    </header>
+    <div id="callBar" class="strip" hidden></div>
+    <main id="list"></main>
+    <footer id="foot">
+      <textarea id="text" rows="1" placeholder="发消息" maxlength="1000"></textarea>
+      <button id="plus" aria-label="更多"><svg class="i"><use href="#i-plus"/></svg></button>
+      <button id="send" hidden>发送</button>
+    </footer>
+    <div id="more" hidden>
+      <button data-act="album"><span class="ic"><svg class="i"><use href="#i-image"/></svg></span>照片/视频</button>
+      <button data-act="photo"><span class="ic"><svg class="i"><use href="#i-camera"/></svg></span>拍照</button>
+      <button data-act="record"><span class="ic"><svg class="i"><use href="#i-record"/></svg></span>录像</button>
+      <button data-act="vcall"><span class="ic"><svg class="i"><use href="#i-video"/></svg></span>视频通话</button>
+      <button data-act="acall"><span class="ic"><svg class="i"><use href="#i-phone"/></svg></span>语音通话</button>
+    </div>
+  </section>
   <input type="file" id="pickAlbum" accept="image/*,video/*" multiple hidden>
   <input type="file" id="pickPhoto" accept="image/*" capture="environment" hidden>
   <input type="file" id="pickVideo" accept="video/*" capture="environment" hidden>
@@ -695,11 +865,12 @@ PAGE = r"""<!doctype html>
       </div>
       <input type="file" id="file" accept="image/*" hidden>
     </div>
-    <input id="nick" maxlength="20" placeholder="群昵称，比如：爸爸、加加" autofocus>
+    <input id="nick" maxlength="20" placeholder="昵称，比如：爸爸、加加" autofocus>
     <div class="row2">
       <button id="cancel" type="button" hidden>取消</button>
-      <button id="join" type="button">进入群聊</button>
+      <button id="join" type="button">进入</button>
     </div>
+    <button id="loginLink" type="button" hidden>在另一台手机/电脑上登录我的账号</button>
   </div>
 </div>
 
@@ -729,11 +900,24 @@ PAGE = r"""<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 const list = $("list"), textEl = $("text"), sendBtn = $("send");
-let ws, myName = "", lastTs = 0, joined = false, token = "", vapidKey = null, iceServers = [], limits = { image_mb:15, video_mb:100 };
-let avatars = {}, users = [];
-let myAvatar = null, draftAvatar = null, soundOn = true;
-let unread = 0, pushActive = false, swReg = null;
-try { myAvatar = localStorage.getItem("chatAvatar"); soundOn = localStorage.getItem("chatSound") !== "0"; } catch (e) {}
+let ws, myName = "", joined = false, token = "", vapidKey = null, iceServers = [], limits = { image_mb:15, video_mb:100 };
+let avatars = {}, users = [], members = [];
+let myAvatar = null, draftAvatar = null, soundOn = true, uid = "";
+let pushActive = false, swReg = null, pendingOpen = null;
+const ls = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} }
+};
+myAvatar = ls.get("chatAvatar"); soundOn = ls.get("chatSound") !== "0";
+uid = ls.get("chatUid");
+if (!uid) { uid = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join(""); ls.set("chatUid", uid); }
+(function readHash() {                       // 登录链接 #k=…&n=… ；通知点开 #c=…
+  const h = location.hash.slice(1); if (!h) return;
+  const p = new URLSearchParams(h);
+  if (p.get("k")) { uid = p.get("k"); ls.set("chatUid", uid); if (p.get("n")) ls.set("chatName", p.get("n")); }
+  if (p.get("c")) pendingOpen = p.get("c");
+  history.replaceState(null, "", location.pathname);
+})();
 const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
 const COLORS = ["#5b8ff9","#f6903d","#61ddaa","#e8684a","#9270ca","#269a99","#ff99c3","#d4a017"];
@@ -782,13 +966,16 @@ function startRing() {
 function stopRing() { clearInterval(ringTimer); ringTimer = null; if (navigator.vibrate) navigator.vibrate(0); }
 function paintSound() { $("soundBtn").innerHTML = icon(soundOn ? "i-bell" : "i-bell-off"); $("soundBtn").title = soundOn ? "提示音：开" : "提示音：关"; }
 $("soundBtn").onclick = () => {
-  soundOn = !soundOn; try { localStorage.setItem("chatSound", soundOn ? "1" : "0"); } catch (e) {}
+  soundOn = !soundOn; ls.set("chatSound", soundOn ? "1" : "0");
   paintSound(); toast(soundOn ? "提示音已打开" : "提示音已关闭"); unlockAudio(); if (soundOn) setTimeout(ding, 50);
 };
 paintSound();
 
 /* ================= 系统通知 / 推送 ================= */
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").then(r => { swReg = r; }).catch(() => {});
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").then(r => { swReg = r; }).catch(() => {});
+  navigator.serviceWorker.addEventListener("message", e => { if (e.data && e.data.open) openWhenReady(e.data.open); });
+}
 function b64u(buf) { return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
 function u8(b64) { const s = atob(b64.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - b64.length % 4) % 4)); return Uint8Array.from(s, c => c.charCodeAt(0)); }
 const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
@@ -806,13 +993,13 @@ async function setupPush() {
     return true;
   } catch (e) { console.warn("push", e); return false; }
 }
-function notify(title, body, tag, call) {
+function notify(title, body, tag, conv, call) {
   if (pushActive || !document.hidden) return;               // 有推送时由后台推送负责弹通知
   if (!("Notification" in window) || Notification.permission !== "granted") return;
-  const opts = { body, tag, icon:"/icon-192.png", badge:"/icon-192.png", renotify:true, requireInteraction:!!call };
-  if (swReg) swReg.showNotification(title, opts).catch(() => {}); else try { new Notification(title, opts); } catch (e) {}
+  const opts = { body, tag, icon:"/icon-192.png", badge:"/icon-192.png", renotify:true, requireInteraction:!!call, data:{ conv } };
+  if (swReg) swReg.showNotification(title, opts).catch(() => {});
+  else try { const n = new Notification(title, opts); n.onclick = () => { window.focus(); openWhenReady(conv); }; } catch (e) {}
 }
-function alertDismissed(key) { try { return localStorage.getItem("alertX") === key; } catch (e) { return false; } }
 function updateAlertBar() {
   let msg = "", key = "", canAsk = false;
   if (isIOS && !standalone && !("PushManager" in window)) {
@@ -822,7 +1009,7 @@ function updateAlertBar() {
     else if (Notification.permission === "denied") { key = "denied"; msg = "消息提醒被关掉了，可以在浏览器的网站设置里重新允许通知。"; }
   }
   const bar = $("alertBar");
-  if (!msg || !joined || alertDismissed(key)) { bar.hidden = true; return; }
+  if (!msg || !joined || ls.get("alertX") === key) { bar.hidden = true; return; }
   bar.querySelector(".t").textContent = msg; $("alertOn").hidden = !canAsk; bar.dataset.key = key; bar.hidden = false;
 }
 $("alertOn").onclick = async () => {
@@ -835,18 +1022,13 @@ $("alertOn").onclick = async () => {
   }
   updateAlertBar();
 };
-$("alertX").onclick = () => { try { localStorage.setItem("alertX", $("alertBar").dataset.key); } catch (e) {} $("alertBar").hidden = true; };
+$("alertX").onclick = () => { ls.set("alertX", $("alertBar").dataset.key); $("alertBar").hidden = true; };
 
 function sendVis() { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type:"vis", visible:!document.hidden })); }
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) { unread = 0; document.title = "群聊"; }
-  sendVis();
+  if (!document.hidden && current) { getConv(current).unread = 0; renderHomeSoon(); }
+  updateDocTitle(); sendVis();
 });
-function onIncoming(m) {        // 别人发来的新消息
-  if (document.hidden) { unread++; document.title = `(${unread}) 群聊`; }
-  if (!document.hidden || !pushActive) ding();
-  notify(m.name, m.type === "image" ? "[图片]" : m.type === "video" ? "[视频]" : m.text, "m-" + (m.id || m.ts));
-}
 
 /* ================= 头像 ================= */
 function makeAvatar(name, src) {
@@ -854,12 +1036,16 @@ function makeAvatar(name, src) {
   const d = document.createElement("div"); d.className = "avatar"; d.dataset.name = name;
   d.style.background = colorOf(name); d.textContent = [...name][0] || "?"; return d;
 }
+function wireAvatar(av, name) {
+  if (name === myName) av.onclick = openSheet;
+  else av.onclick = () => openConv("dm:" + name);
+}
 function refreshAvatars() {
   document.querySelectorAll("#list .avatar").forEach(el => {
     const n = el.dataset.name, fresh = makeAvatar(n, avatars[n]);
-    if (n === myName) fresh.onclick = openSheet;
-    el.replaceWith(fresh);
+    wireAvatar(fresh, n); el.replaceWith(fresh);
   });
+  renderHomeSoon();
 }
 function showPreview() {
   const p = $("preview"), name = $("nick").value.trim() || myName || "我";
@@ -882,9 +1068,108 @@ function shrink(file) {
 }
 function openSheet() {
   draftAvatar = myAvatar; $("nick").value = myName; $("nick").disabled = true;
-  $("sheetTitle").textContent = "换头像"; $("join").textContent = "保存"; $("cancel").hidden = false;
+  $("sheetTitle").textContent = "我的资料"; $("join").textContent = "保存"; $("cancel").hidden = false; $("loginLink").hidden = false;
   showPreview(); $("sheet").hidden = false;
 }
+$("loginLink").onclick = async () => {
+  const link = `${location.origin}/#k=${encodeURIComponent(uid)}&n=${encodeURIComponent(myName)}`;
+  let ok = false;
+  try { await navigator.clipboard.writeText(link); ok = true; } catch (e) {}
+  if (ok) toast("链接已复制。在另一台设备的浏览器里打开它，就能用同一个账号，私聊记录也在。这个链接别发给别人。", 5000);
+  else window.prompt("复制这个链接，在另一台设备上打开（别发给别人）：", link);
+};
+
+/* ================= 会话（群聊 + 私聊） ================= */
+const convs = new Map();
+let current = null;                                  // 正在看的会话；null = 聊天列表
+const peerOf = key => key.slice(3);
+function convKey(m) { return m.to ? "dm:" + (m.name === myName ? m.to : m.name) : "group"; }
+function getConv(key) {
+  let c = convs.get(key);
+  if (!c) { c = { key, msgs:[], unread:0, lastTs:0, rTs:0 }; convs.set(key, c); }
+  return c;
+}
+function convTitle(key) { return key === "group" ? "群聊" : peerOf(key); }
+function totalUnread() { let n = 0; convs.forEach(c => n += c.unread); return n; }
+function updateDocTitle() {
+  const n = totalUnread();
+  document.title = n ? `(${n}) 群聊` : "群聊";
+  const others = n - (current ? getConv(current).unread : 0);
+  $("back").querySelector(".ub").textContent = others > 0 ? String(others) : "";
+}
+function previewOf(m, key) {
+  if (m.type === "system") return m.text;
+  const body = m.type === "image" ? "[图片]" : m.type === "video" ? "[视频]" : m.text;
+  return key === "group" ? `${m.name === myName ? "我" : m.name}: ${body}` : body;
+}
+function fmtShort(ts) {
+  const d = new Date(ts), now = new Date();
+  const day = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diff = Math.round((day(now) - day(d)) / 86400000);
+  if (diff === 0) return d.toLocaleTimeString("zh-CN", { hour:"2-digit", minute:"2-digit", hour12:false });
+  if (diff === 1) return "昨天";
+  return `${d.getMonth()+1}/${d.getDate()}`;
+}
+let homeQueued = false;
+function renderHomeSoon() { if (homeQueued) return; homeQueued = true; requestAnimationFrame(() => { homeQueued = false; renderHome(); }); }
+function renderHome() {
+  const keys = new Set(["group"]);
+  members.forEach(n => { if (n !== myName) keys.add("dm:" + n); });
+  convs.forEach((c, k) => { if (k !== "group" && c.msgs.length) keys.add(k); });
+  const arr = [...keys].map(getConv).sort((a, b) => {
+    if (a.key === "group") return -1; if (b.key === "group") return 1;
+    return (b.lastTs - a.lastTs) || peerOf(a.key).localeCompare(peerOf(b.key), "zh");
+  });
+  const box = $("convList"); box.replaceChildren();
+  for (const c of arr) {
+    const row = document.createElement("div"); row.className = "conv"; row.dataset.key = c.key;
+    const av = document.createElement("div"); av.className = "av";
+    if (c.key === "group") { const g = document.createElement("div"); g.className = "avatar gav"; g.innerHTML = icon("i-group"); av.append(g); }
+    else {
+      const p = peerOf(c.key); av.append(makeAvatar(p, avatars[p]));
+      if (users.includes(p)) { const d = document.createElement("span"); d.className = "dot"; d.title = "在线"; av.append(d); }
+    }
+    if (c.unread) { const b = document.createElement("span"); b.className = "badge"; b.textContent = c.unread > 99 ? "99+" : c.unread; av.append(b); }
+    const main = document.createElement("div"); main.className = "cmain";
+    const top = document.createElement("div"); top.className = "ctop";
+    const t = document.createElement("span"); t.className = "ctitle"; t.textContent = c.key === "group" ? `群聊（${users.length}人在线）` : peerOf(c.key);
+    const tm = document.createElement("span"); tm.className = "ctime";
+    const last = [...c.msgs].reverse().find(m => !m.quiet);
+    if (last) tm.textContent = fmtShort(last.ts);
+    top.append(t, tm);
+    const pv = document.createElement("div"); pv.className = "cprev";
+    const cl = calls.get(c.key);
+    if (cl && !(inCall && callKey === c.key)) { const s = document.createElement("span"); s.className = "live"; s.textContent = `[${cl.media === "video" ? "视频" : "语音"}通话中] `; pv.append(s); }
+    pv.append(last ? previewOf(last, c.key) : (c.key === "group" ? "" : users.includes(peerOf(c.key)) ? "在线 · 点这里私聊" : "点这里私聊"));
+    main.append(top, pv); row.append(av, main);
+    row.onclick = () => openConv(c.key);
+    box.append(row);
+  }
+  updateDocTitle();
+}
+function setChatHeader() {
+  if (!current) return;
+  $("chatTitle").textContent = convTitle(current);
+  $("chatCount").textContent = current === "group" ? `（${users.length}）` : (users.includes(peerOf(current)) ? "" : "（离线）");
+}
+function openConv(key, push = true) {
+  if (!joined || !myName) { pendingOpen = key; return; }
+  if (key !== "group" && !key.startsWith("dm:")) return;
+  if (key === "dm:" + myName) return;
+  const same = current === key;
+  current = key; getConv(key).unread = 0;
+  $("home").hidden = true; $("chat").hidden = false;
+  list.classList.toggle("dm", key !== "group");
+  setChatHeader(); setMore(false); renderConv(key); updateCallBar(); renderHomeSoon();
+  if (push && !same) history.pushState({ c:key }, "");
+}
+function openWhenReady(key) { if (joined && myName) openConv(key); else pendingOpen = key; }
+function goHome() {
+  current = null; setMore(false); textEl.blur();
+  $("chat").hidden = true; $("home").hidden = false; renderHome();
+}
+$("back").onclick = () => { if (history.state && history.state.c) history.back(); else goHome(); };
+window.addEventListener("popstate", () => { if (current) goHome(); });
 
 /* ================= 消息列表 ================= */
 function fmtTime(ts) {
@@ -898,7 +1183,7 @@ function fmtTime(ts) {
 }
 function fitSize(w, h, kind) {
   if (!w || !h) return kind === "video" ? { w:220, h:160 } : { w:160, h:160 };
-  const maxW = Math.min(220, list.clientWidth * 0.58), maxH = 260, s = Math.min(maxW / w, maxH / h, 1);
+  const maxW = Math.min(220, (list.clientWidth || 360) * 0.58), maxH = 260, s = Math.min(maxW / w, maxH / h, 1);
   return { w:Math.max(Math.round(w * s), 70), h:Math.max(Math.round(h * s), 70) };
 }
 function mediaBox(kind, url, w, h) {
@@ -915,8 +1200,7 @@ function mediaBox(kind, url, w, h) {
 function buildRow(m) {
   const mine = m.name === myName;
   const row = document.createElement("div"); row.className = "msg" + (mine ? " me" : "");
-  const av = makeAvatar(m.name, avatars[m.name]);
-  if (mine) av.onclick = openSheet;
+  const av = makeAvatar(m.name, avatars[m.name]); wireAvatar(av, m.name);
   const body = document.createElement("div"); body.className = "body";
   const name = document.createElement("div"); name.className = "name"; name.textContent = m.name;
   let content;
@@ -926,46 +1210,74 @@ function buildRow(m) {
   body.append(name, content); row.append(av, body);
   return row;
 }
-function stamp(ts) {
-  if (ts - lastTs > 5 * 60 * 1000) { const t = document.createElement("div"); t.className = "time"; t.textContent = fmtTime(ts); list.append(t); }
-  lastTs = ts;
+function appendToList(m, c) {
+  const ts = m.ts || Date.now();
+  if (ts - c.rTs > 5 * 60 * 1000) { const t = document.createElement("div"); t.className = "time"; t.textContent = fmtTime(ts); list.append(t); }
+  c.rTs = ts;
+  if (m.type === "system") { const s = document.createElement("div"); s.className = "sys"; s.textContent = m.text; list.append(s); }
+  else list.append(buildRow(m));
+}
+function renderConv(key) {
+  const c = getConv(key); c.rTs = 0; list.replaceChildren();
+  c.msgs.forEach(m => appendToList(m, c));
+  pending.forEach(p => { if (p.key === key) list.append(p.row); });
+  list.scrollTop = list.scrollHeight;
 }
 const pending = new Map();   // 正在上传的消息
+const MSG_TYPES = ["system", "chat", "image", "video"];
 function add(m, live) {
-  const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+  if (!MSG_TYPES.includes(m.type)) return;
+  const key = convKey(m), c = getConv(key);
+  c.msgs.push(m); if (c.msgs.length > 400) c.msgs.shift();
+  if (!m.quiet) c.lastTs = Math.max(c.lastTs, m.ts || 0);
   if (m.cid && pending.has(m.cid) && m.name === myName) {      // 自己上传完成：把占位换成正式消息
     const p = pending.get(m.cid); pending.delete(m.cid);
-    p.row.replaceWith(buildRow(m)); if (p.local) setTimeout(() => URL.revokeObjectURL(p.local), 5000);
-    return;
+    if (p.row.isConnected) p.row.replaceWith(buildRow(m));
+    if (p.local) setTimeout(() => URL.revokeObjectURL(p.local), 5000);
+    renderHomeSoon(); return;
   }
-  const ts = m.ts || Date.now();
-  if (m.type === "system") { stamp(ts); const s = document.createElement("div"); s.className = "sys"; s.textContent = m.text; list.append(s); }
-  else if (m.type === "chat" || m.type === "image" || m.type === "video") {
-    stamp(ts); list.append(buildRow(m));
-    if (live && m.name !== myName) onIncoming(m);
-  } else return;
-  if (atBottom || m.name === myName) list.scrollTop = list.scrollHeight;
+  if (key === current) {
+    const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+    appendToList(m, c);
+    if (atBottom || m.name === myName) list.scrollTop = list.scrollHeight;
+  }
+  if (live && m.type !== "system" && m.name !== myName) {
+    if (key !== current || document.hidden) c.unread++;
+    if (!document.hidden || !pushActive) ding();
+    const body = m.type === "image" ? "[图片]" : m.type === "video" ? "[视频]" : m.text;
+    if (key === "group") notify("群聊", `${m.name}: ${body}`, "m-" + (m.id || m.ts), key);
+    else notify(m.name, body, "m-" + (m.id || m.ts), key);
+  }
+  if (live) renderHomeSoon();
 }
 function viewImage(url) { const v = $("viewer"); v.querySelector("img").src = url; v.hidden = false; }
 $("viewer").onclick = () => { $("viewer").hidden = true; $("viewer").querySelector("img").src = ""; };
 
 /* ================= 连接 ================= */
+function setStatus(t) { document.querySelectorAll(".status").forEach(el => el.textContent = t); }
 function connect(name) {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onopen = () => { ws.send(JSON.stringify({ type:"join", name, avatar:myAvatar, visible:!document.hidden })); $("status").textContent = ""; };
+  ws.onopen = () => { ws.send(JSON.stringify({ type:"join", name, uid, avatar:myAvatar, visible:!document.hidden })); setStatus(""); };
   ws.onmessage = e => {
     const m = JSON.parse(e.data);
     if (m.type === "welcome") {
       myName = m.name; avatars = m.avatars || {}; token = m.token; vapidKey = m.vapid; iceServers = m.ice || []; limits = m.limits || limits;
-      list.replaceChildren(); lastTs = 0; m.history.forEach(x => add(x, false)); list.scrollTop = list.scrollHeight;
-      pending.forEach(p => list.append(p.row));
+      if (myName !== name) ls.set("chatName", myName);
+      const unread = new Map([...convs].map(([k, c]) => [k, c.unread]));
+      convs.clear();
+      m.history.forEach(x => add(x, false));
+      unread.forEach((n, k) => { if (n) getConv(k).unread = n; });
+      calls.clear(); (m.calls || []).forEach(c => onCallState(c));
       if ("Notification" in window && Notification.permission === "granted") setupPush();
-      updateAlertBar(); onCallState(m.call, true);
+      updateAlertBar();
+      if (pendingOpen) { const k = pendingOpen; pendingOpen = null; openConv(k); }
+      else if (current) { setChatHeader(); renderConv(current); }
+      renderHome();
     }
     else if (m.type === "avatars") { avatars = m.avatars; refreshAvatars(); }
-    else if (m.type === "users") { users = m.users; $("count").textContent = `（${m.users.length}）`; }
-    else if (m.type === "call_state") onCallState(m.call, false);
+    else if (m.type === "users") { users = m.users; members = m.members || users; setChatHeader(); renderHomeSoon(); }
+    else if (m.type === "call_state") onCallState(m.call);
     else if (m.type === "call_joined") onCallJoined(m);
     else if (m.type === "call_declined") onDeclined(m.name);
     else if (m.type === "signal") onSignal(m.from, m.data);
@@ -973,7 +1285,7 @@ function connect(name) {
     else add(m, true);
   };
   ws.onclose = () => {
-    $("status").textContent = "连接中…";
+    setStatus("连接中…");
     if (inCall) endLocal("网络断开，通话已结束");
     setTimeout(() => connect(myName || name), 3000);
   };
@@ -981,18 +1293,16 @@ function connect(name) {
 
 function join() {
   unlockAudio();
-  if (joined) {                        // 已在群里：只是换头像
-    myAvatar = draftAvatar;
-    try { myAvatar ? localStorage.setItem("chatAvatar", myAvatar) : localStorage.removeItem("chatAvatar"); } catch (e) {}
+  if (joined) {                        // 已经进来了：只是换头像
+    myAvatar = draftAvatar; ls.set("chatAvatar", myAvatar);
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type:"avatar", avatar:myAvatar }));
     $("sheet").hidden = true; return;
   }
   const name = $("nick").value.trim();
   if (!name) return $("nick").focus();
-  myAvatar = draftAvatar;
-  try { localStorage.setItem("chatName", name); myAvatar ? localStorage.setItem("chatAvatar", myAvatar) : localStorage.removeItem("chatAvatar"); } catch (e) {}
+  myAvatar = draftAvatar; ls.set("chatName", name); ls.set("chatAvatar", myAvatar);
   joined = true; $("profileBtn").hidden = false; $("soundBtn").hidden = false;
-  $("sheet").hidden = true; connect(name); textEl.focus();
+  $("sheet").hidden = true; connect(name);
 }
 $("choose").onclick = () => $("file").click();
 $("file").onchange = async () => {
@@ -1010,10 +1320,11 @@ function grow() {
   textEl.style.height = "38px"; textEl.style.height = Math.min(textEl.scrollHeight, 120) + "px";
   const has = !!textEl.value.trim(); sendBtn.hidden = !has; $("plus").hidden = has;
 }
+const toOf = key => key && key !== "group" ? peerOf(key) : undefined;
 function send() {
   const text = textEl.value.trim();
-  if (!text || !ws || ws.readyState !== 1) return;
-  ws.send(JSON.stringify({ text })); textEl.value = ""; grow(); textEl.focus();
+  if (!text || !ws || ws.readyState !== 1 || !current) return;
+  ws.send(JSON.stringify({ text, to:toOf(current) })); textEl.value = ""; grow(); textEl.focus();
 }
 function setMore(open) { $("more").hidden = !open; $("foot").classList.toggle("open", open); if (open) list.scrollTop = list.scrollHeight; }
 $("plus").onclick = () => { setMore($("more").hidden); if (!$("more").hidden) textEl.blur(); };
@@ -1025,19 +1336,17 @@ $("more").onclick = e => {
   if (a === "album") $("pickAlbum").click();
   else if (a === "photo") $("pickPhoto").click();
   else if (a === "record") $("pickVideo").click();
-  else if (a === "vcall") { setMore(false); startOrJoin("video"); }
-  else if (a === "acall") { setMore(false); startOrJoin("audio"); }
+  else if (a === "vcall") { setMore(false); startOrJoin("video", current); }
+  else if (a === "acall") { setMore(false); startOrJoin("audio", current); }
 };
 ["pickAlbum", "pickPhoto", "pickVideo"].forEach(id => $(id).onchange = e => {
-  const files = [...e.target.files]; e.target.value = ""; setMore(false); sendFiles(files);
+  const files = [...e.target.files]; e.target.value = ""; setMore(false); sendFiles(files, current);
 });
 $("join").onclick = join;
 $("nick").onkeydown = e => { if (e.key === "Enter" && !e.isComposing) join(); };
 textEl.oninput = grow;
 textEl.onkeydown = e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } };
 sendBtn.onclick = send;
-try { $("nick").value = localStorage.getItem("chatName") || ""; } catch (e) {}
-draftAvatar = myAvatar; showPreview();
 
 /* ================= 发图片 / 视频 ================= */
 const VIDEO_EXT = { mp4:"video/mp4", m4v:"video/x-m4v", mov:"video/quicktime", webm:"video/webm", "3gp":"video/3gpp" };
@@ -1075,7 +1384,7 @@ function videoMeta(file) {
     v.src = u;
   });
 }
-function addPending(kind, localUrl, w, h) {
+function addPending(kind, localUrl, w, h, key) {
   const cid = Math.random().toString(36).slice(2, 12);
   const row = document.createElement("div"); row.className = "msg me";
   const av = makeAvatar(myName, avatars[myName]); av.onclick = openSheet;
@@ -1083,13 +1392,15 @@ function addPending(kind, localUrl, w, h) {
   const box = mediaBox(kind, localUrl, w, h);
   const v = box.querySelector("video"); if (v) v.controls = false;
   const up = document.createElement("div"); up.className = "up"; up.textContent = "0%"; box.append(up);
-  body.append(box); row.append(av, body); list.append(row); list.scrollTop = list.scrollHeight;
-  const p = { row, local:localUrl, up }; pending.set(cid, p);
+  body.append(box); row.append(av, body);
+  if (key === current) { list.append(row); list.scrollTop = list.scrollHeight; }
+  const p = { row, local:localUrl, up, key }; pending.set(cid, p);
   return { cid, p };
 }
-function upload(kind, blob, type, meta, cid, onProgress) {
+function upload(kind, blob, type, meta, cid, key, onProgress) {
   return new Promise((res, rej) => {
     const q = new URLSearchParams({ token, kind, cid, w:meta.w || 0, h:meta.h || 0, dur:Math.round(meta.dur || 0) });
+    if (toOf(key)) q.set("to", toOf(key));
     const x = new XMLHttpRequest(); x.open("POST", "/upload?" + q);
     x.setRequestHeader("Content-Type", type);
     x.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
@@ -1098,8 +1409,9 @@ function upload(kind, blob, type, meta, cid, onProgress) {
     x.send(blob);
   });
 }
-async function sendFiles(files) {
+async function sendFiles(files, key) {
   if (!ws || ws.readyState !== 1 || !token) return toast("还没连上，稍后再试");
+  if (!key) return;
   for (const f of files) {
     let kind, blob, type, meta;
     try {
@@ -1114,9 +1426,9 @@ async function sendFiles(files) {
       } else { toast("只能发图片和视频"); continue; }
     } catch (e) { toast("这个文件打不开，换一个试试"); continue; }
     const local = URL.createObjectURL(blob);
-    const { cid, p } = addPending(kind, local, meta.w, meta.h);
+    const { cid, p } = addPending(kind, local, meta.w, meta.h, key);
     try {
-      await upload(kind, blob, type, meta, cid, r => { p.up.textContent = Math.round(r * 100) + "%"; if (r >= 1) p.up.textContent = "处理中…"; });
+      await upload(kind, blob, type, meta, cid, key, r => { p.up.textContent = Math.round(r * 100) + "%"; if (r >= 1) p.up.textContent = "处理中…"; });
       if (pending.has(cid)) p.up.hidden = true;
     } catch (e) {
       p.up.textContent = (e.message || "发送失败") + "（点一下移除）"; p.up.classList.add("err");
@@ -1126,55 +1438,68 @@ async function sendFiles(files) {
 }
 
 /* ================= 语音 / 视频通话 ================= */
-let call = null, inCall = false, callMedia = "video", localStream = null;
-let rungFor = null, declinedFor = null, declined = new Set();
+const calls = new Map();                 // 会话 key -> 进行中的通话
+let callKey = null, inCall = false, callMedia = "video", localStream = null;
+let ringKey = null, ringStart = 0, declinedFor = null, declined = new Set();
+const rung = new Map();
 let connectedAt = 0, aloneTimer = null, clockTimer = null, ringStopTimer = null, wakeLock = null;
 let micOn = true, camOn = true, facing = "user";
 const peers = new Map(), tiles = new Map();
 let sigChain = Promise.resolve();
 const sig = (to, data) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type:"signal", to, data })); };
 const label = media => media === "video" ? "视频" : "语音";
+const myCall = () => callKey ? calls.get(callKey) : null;
+function callKeyOf(c) { return c.invite ? "dm:" + (c.invite.find(n => n !== myName) || myName) : "group"; }
 
-function onCallState(c, fromWelcome) {
-  call = c;
-  if (!c) {
-    $("callBar").hidden = true; hideRing();
-    if (inCall) endLocal("通话已结束");
-    return;
+function onCallState(c) {
+  const key = callKeyOf(c);
+  if (c.ended) calls.delete(key); else calls.set(key, c);
+  if (inCall && key === callKey) {
+    if (c.ended || !c.members.includes(myName)) endLocal("通话已结束");
+    else {
+      rung.set(key, c.start);
+      if (c.members.length === 1 && connectedAt) { hangup(); toast("对方已挂断"); }
+      else {
+        for (const n of [...peers.keys()]) if (!c.members.includes(n)) { closePeer(n); toast(`${n} 已挂断`); }
+        for (const n of [...tiles.keys()]) if (n !== myName && !c.members.includes(n)) removeTile(n);
+        updateCallTop();
+      }
+    }
+  } else if (c.ended) {
+    if (ringKey === key) hideRing();
+  } else if (!inCall) {
+    const fresh = Date.now() - c.start < 60000;
+    if (rung.get(key) !== c.start && declinedFor !== c.start && fresh && !c.members.includes(myName) && c.members.length) {
+      rung.set(key, c.start); showRing(c, key);
+    }
   }
-  if (inCall) {
-    rungFor = c.start;
-    if (!c.members.includes(myName)) { endLocal("通话已结束"); return; }
-    if (c.members.length === 1 && connectedAt) { hangup(); toast("对方已挂断"); return; }
-    for (const n of [...peers.keys()]) if (!c.members.includes(n)) { closePeer(n); toast(`${n} 已挂断`); }
-    for (const n of [...tiles.keys()]) if (n !== myName && !c.members.includes(n)) removeTile(n);
-    updateCallTop();
-    return;
-  }
-  const bar = $("callBar");
-  bar.textContent = `${c.by} 发起的${label(c.media)}通话进行中（${c.members.length}人）· 点这里加入`;
-  bar.hidden = false;
-  const fresh = Date.now() - c.start < 60000;
-  if (rungFor !== c.start && declinedFor !== c.start && fresh && !c.members.includes(myName)) {
-    rungFor = c.start; showRing(c);
-  }
+  updateCallBar(); renderHomeSoon();
 }
-function showRing(c) {
+function updateCallBar() {
+  const bar = $("callBar"), c = current && calls.get(current);
+  if (!c || (inCall && callKey === current) || c.members.includes(myName)) { bar.hidden = true; return; }
+  bar.textContent = current === "group"
+    ? `${c.by} 发起的群${label(c.media)}通话进行中（${c.members.length}人）· 点这里加入`
+    : `${c.by} 的${label(c.media)}通话进行中 · 点这里加入`;
+  bar.hidden = false;
+}
+function showRing(c, key) {
   const av = makeAvatar(c.by, avatars[c.by]); av.classList.add("big");
   $("ringAv").replaceChildren(av);
   $("ringName").textContent = c.by;
-  $("ringText").textContent = `邀请你${label(c.media)}通话…`;
+  $("ringText").textContent = key === "group" ? `邀请你加入群${label(c.media)}通话…` : `邀请你${label(c.media)}通话…`;
+  ringKey = key; ringStart = c.start;
   $("ring").hidden = false; startRing();
-  notify(c.by, `邀请你${label(c.media)}通话`, "call-" + c.start, true);
+  notify(c.by, $("ringText").textContent, "call-" + c.start, key, true);
   clearTimeout(ringStopTimer); ringStopTimer = setTimeout(hideRing, 60000);
 }
-function hideRing() { $("ring").hidden = true; stopRing(); clearTimeout(ringStopTimer); }
-$("accept").onclick = () => { hideRing(); startOrJoin(call ? call.media : "video"); };
+function hideRing() { $("ring").hidden = true; stopRing(); clearTimeout(ringStopTimer); ringKey = null; }
+$("accept").onclick = () => { const k = ringKey, c = calls.get(k); hideRing(); if (k) { openConv(k); startOrJoin(c ? c.media : "video", k); } };
 $("decline").onclick = () => {
-  if (call) { declinedFor = call.start; if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type:"call_decline" })); }
+  if (ringKey) { declinedFor = ringStart; if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type:"call_decline", to:toOf(ringKey) })); }
   hideRing();
 };
-$("callBar").onclick = () => { if (call) startOrJoin(call.media); };
+$("callBar").onclick = () => { const c = current && calls.get(current); if (c) startOrJoin(c.media, current); };
 
 async function getMedia(media) {
   return navigator.mediaDevices.getUserMedia({
@@ -1182,19 +1507,21 @@ async function getMedia(media) {
     video:media === "video" ? { facingMode:facing, width:{ ideal:960 }, height:{ ideal:720 } } : false
   });
 }
-async function startOrJoin(media) {
-  if (inCall) return;
+async function startOrJoin(media, key) {
+  if (inCall || !key) return;
   unlockAudio();
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.RTCPeerConnection) return toast("这个浏览器不支持通话，换 Chrome 或 Safari 试试");
   if (!ws || ws.readyState !== 1) return toast("还没连上，稍后再试");
-  if (call) media = call.media;
-  if (!call && users.length < 2) return toast("群里现在只有你一个人在线");
+  const existing = calls.get(key);
+  if (existing) media = existing.media;
+  if (!existing && key === "group" && users.length < 2) return toast("群里现在只有你一个人在线");
   facing = "user";
   try { localStream = await getMedia(media); }
   catch (e) { return toast(media === "video" ? "没有拿到摄像头和麦克风权限，请在浏览器设置里允许" : "没有拿到麦克风权限，请在浏览器设置里允许", 3500); }
-  inCall = true; callMedia = media; micOn = true; camOn = media === "video"; connectedAt = 0; declined = new Set();
+  inCall = true; callKey = key; callMedia = media; micOn = true; camOn = media === "video"; connectedAt = 0; declined = new Set();
   $("callBar").hidden = true; showCallView();
-  ws.send(JSON.stringify(call ? { type:"call_join" } : { type:"call_start", media }));
+  ws.send(JSON.stringify({ type:existing ? "call_join" : "call_start", media, to:toOf(key) }));
+  if (!existing && key !== "group" && !users.includes(peerOf(key))) toast(`${peerOf(key)} 现在不在线，已给 TA 发提醒`, 3000);
   try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
 }
 function showCallView() {
@@ -1209,17 +1536,15 @@ function showCallView() {
 }
 function updateCallTop() {
   if (!inCall) return;
-  const others = (call ? call.members : []).filter(n => n !== myName);
-  $("callTitle").textContent = others.length ? others.join("、") : `${label(callMedia)}通话`;
+  const c = myCall();
+  const others = (c ? c.members : []).filter(n => n !== myName);
+  $("callTitle").textContent = others.length ? others.join("、") : (callKey === "group" ? `群${label(callMedia)}通话` : peerOf(callKey));
   if (!connectedAt) $("callTime").textContent = others.length ? "连接中…" : "等待对方接听…";
-  if (!others.length && !aloneTimer) aloneTimer = setTimeout(() => { if (inCall && !connectedAt && call && call.members.length < 2) { toast("对方无应答"); hangup(); } }, 60000);
-  if (!tiles.size && callMedia === "audio") showSelfTile();
+  if (!others.length && !aloneTimer) aloneTimer = setTimeout(() => { const cc = myCall(); if (inCall && !connectedAt && (!cc || cc.members.length < 2)) { toast("对方无应答"); hangup(); } }, 60000);
+  if (!tiles.size && callMedia === "audio") tileFor(myName).st.textContent = "";
   updateSolo();
 }
 function updateSolo() { $("callView").classList.toggle("solo", ![...tiles.keys()].some(n => n !== myName)); }
-function showSelfTile() {   // 语音通话还没人加入时，显示自己的头像
-  const t = tileFor(myName); t.st.textContent = "";
-}
 function onCallJoined(m) {
   if (!inCall) return;
   callMedia = m.media;
@@ -1228,8 +1553,9 @@ function onCallJoined(m) {
 function onDeclined(name) {
   if (!inCall) return;
   toast(`${name} 拒绝了通话`); declined.add(name);
-  const others = users.filter(u => u !== myName);
-  if (call && call.members.length === 1 && others.every(u => declined.has(u))) setTimeout(hangup, 1200);
+  const c = myCall();
+  const others = callKey === "group" ? users.filter(u => u !== myName) : [peerOf(callKey)];
+  if (c && c.members.length === 1 && others.every(u => declined.has(u))) setTimeout(hangup, 1200);
 }
 function tileFor(name) {
   let t = tiles.get(name); if (t) return t;
@@ -1323,7 +1649,7 @@ function endLocal(msg) {
   $("callView").hidden = true; $("callTime").textContent = "";
   if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
   if (msg) toast(msg);
-  if (call && call.members.length && !call.members.includes(myName)) onCallState(call, false);
+  callKey = null; updateCallBar(); renderHomeSoon();
 }
 function paintCallBtns() {
   const mic = $("btnMic"), cam = $("btnCam");
@@ -1350,6 +1676,11 @@ $("btnFlip").onclick = async () => {
   } catch (e) { toast("切换摄像头失败"); }
 };
 window.addEventListener("pagehide", () => { if (inCall && ws && ws.readyState === 1) ws.send(JSON.stringify({ type:"call_leave" })); });
+
+/* ================= 启动 ================= */
+$("nick").value = ls.get("chatName") || "";
+draftAvatar = myAvatar; showPreview();
+if ($("nick").value.trim()) join();          // 以前进来过：直接进入，不用每次再点
 </script>
 </body>
 </html>
